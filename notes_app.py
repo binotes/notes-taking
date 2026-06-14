@@ -29,6 +29,7 @@ import time
 import uuid
 import mimetypes
 import sqlite3
+import secrets
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
@@ -802,6 +803,60 @@ class miniweb:
                 print("\n服务器已停止")
 
 
+# ============================================================
+# 认证管理
+# ============================================================
+
+ADMIN_USERNAME = 'admin'
+ADMIN_PASSWORD = 'admin123'
+
+_sessions = {}
+
+
+def generate_session_token():
+    """生成随机 session token"""
+    return secrets.token_hex(32)
+
+
+def check_auth():
+    """检查当前请求是否已登录，返回 True/False"""
+    req = request()
+    if not req:
+        return False
+    cookie_header = req.headers.get('Cookie', '')
+    cookies = {}
+    for part in cookie_header.split(';'):
+        part = part.strip()
+        if '=' in part:
+            k, v = part.split('=', 1)
+            cookies[k.strip()] = v.strip()
+    token = cookies.get('session', '')
+    return token in _sessions
+
+
+def require_auth():
+    """如果未登录，返回重定向到 /login 的 Response；否则返回 None"""
+    if not check_auth():
+        return Response().redirect('/login')
+    return None
+
+
+def parse_cookies(req):
+    """解析 Cookie header 返回 dict"""
+    cookies = {}
+    cookie_header = req.headers.get('Cookie', '')
+    for part in cookie_header.split(';'):
+        part = part.strip()
+        if '=' in part:
+            k, v = part.split('=', 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
+# ============================================================
+# 应用核心 (Request/Response)
+# ============================================================
+
 def request():
     return _current_request
 
@@ -1364,12 +1419,15 @@ body {
 '''
 
 
-def page(title, content, flash=None):
+def page(title, content, flash=None, is_admin=False):
     """生成完整 HTML 页面"""
     flash_html = ''
     if flash:
         cls = 'flash-success' if flash.get('type') == 'success' else 'flash-error'
         flash_html = f'<div class="flash {cls}">{flash["msg"]}</div>'
+
+    new_btn = '<a href="/new" class="btn btn-primary btn-sm">✏️ 新建笔记</a>' if is_admin else ''
+    login_btn = '<a href="/login" class="btn btn-primary btn-sm">🔑 登录</a>' if not is_admin else '<a href="/logout" class="btn btn-secondary btn-sm">🚪 退出</a>'
 
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1385,7 +1443,8 @@ def page(title, content, flash=None):
             <h1><a href="/">📝 Notes App</a></h1>
             <div class="header-actions">
                 <a href="/" class="btn btn-primary btn-sm">📋 所有笔记</a>
-                <a href="/new" class="btn btn-primary btn-sm">✏️ 新建笔记</a>
+                {new_btn}
+                {login_btn}
             </div>
         </div>
     </div>
@@ -1397,7 +1456,7 @@ def page(title, content, flash=None):
 </html>'''
 
 
-def render_note_card(note):
+def render_note_card(note, is_admin=False):
     """渲染单张笔记卡片"""
     preview = note['content'][:200]
     if len(note['content']) > 200:
@@ -1409,6 +1468,13 @@ def render_note_card(note):
     attachments = note.get('attachments', [])
     attach_badge = f' <span style="font-size:12px;color:#667eea;">📎{len(attachments)}</span>' if attachments else ''
 
+    actions_html = ''
+    if is_admin:
+        actions_html = f'''
+                <a href="/edit/{note['id']}" class="btn btn-secondary btn-sm">编辑</a>
+                <a href="/delete/{note['id']}" class="btn btn-danger btn-sm"
+                   onclick="return confirm('确定删除「{title}」？')">删除</a>'''
+
     return f'''
     <div class="note-card">
         <h3><a href="/note/{note['id']}">{title}{attach_badge}</a></h3>
@@ -1416,9 +1482,7 @@ def render_note_card(note):
         <div class="meta">
             <span>🕐 {note['updated_at']}</span>
             <div class="actions">
-                <a href="/edit/{note['id']}" class="btn btn-secondary btn-sm">编辑</a>
-                <a href="/delete/{note['id']}" class="btn btn-danger btn-sm"
-                   onclick="return confirm('确定删除「{title}」？')">删除</a>
+                {actions_html}
             </div>
         </div>
     </div>'''
@@ -1441,7 +1505,7 @@ def get_attachment_icon(filename):
     return icons.get(ext, '📎')
 
 
-def render_attachments_html(note_id, attachments):
+def render_attachments_html(note_id, attachments, is_admin=False):
     """渲染附件列表 HTML"""
     if not attachments:
         return '<div class="no-attachments">暂无附件</div>'
@@ -1452,6 +1516,16 @@ def render_attachments_html(note_id, attachments):
         name = att['original_name'].replace('<', '&lt;').replace('>', '&gt;')
         size_str = format_file_size(att['size'])
         time_str = att.get('uploaded_at', '')
+        delete_btn = ''
+        if is_admin:
+            delete_btn = f'''
+            <div class="attachment-actions">
+                <form method="POST" action="/note/{note_id}/attachment/{att['stored_name']}/delete"
+                      style="display:inline;"
+                      onsubmit="return confirm('确定删除附件「{name}」？')">
+                    <button type="submit" class="btn btn-danger btn-sm" style="padding:4px 10px;font-size:12px;">删除</button>
+                </form>
+            </div>'''
         items.append(f'''
         <li class="attachment-item">
             <div class="attachment-info">
@@ -1461,13 +1535,7 @@ def render_attachments_html(note_id, attachments):
                     <span class="attachment-meta">{size_str} · {time_str}</span>
                 </span>
             </div>
-            <div class="attachment-actions">
-                <form method="POST" action="/note/{note_id}/attachment/{att['stored_name']}/delete"
-                      style="display:inline;"
-                      onsubmit="return confirm('确定删除附件「{name}」？')">
-                    <button type="submit" class="btn btn-danger btn-sm" style="padding:4px 10px;font-size:12px;">删除</button>
-                </form>
-            </div>
+            {delete_btn}
         </li>''')
     return '<ul class="attachment-list">' + ''.join(items) + '</ul>'
 
@@ -1482,6 +1550,7 @@ app = miniweb(host='0.0.0.0', port=8080)
 @app.route('/')
 def index():
     """首页 - 笔记列表"""
+    is_admin = check_auth()
     keyword = request().get('q', '')
     notes = search_notes(keyword) if keyword else load_notes()
     total = len(load_notes())
@@ -1504,7 +1573,7 @@ def index():
 
     # 笔记列表
     if notes:
-        cards = ''.join(render_note_card(n) for n in notes)
+        cards = ''.join(render_note_card(n, is_admin=is_admin) for n in notes)
         content = search_html + stats_html + cards
     else:
         if keyword:
@@ -1522,12 +1591,15 @@ def index():
                 <p>点击上方「新建笔记」开始记录</p>
             </div>'''
 
-    return page('首页', content)
+    return page('首页', content, is_admin=is_admin)
 
 
 @app.route('/new')
 def new_note_form():
     """新建笔记表单"""
+    r = require_auth()
+    if r:
+        return r
     content = '''
     <div class="form-card">
         <h2 style="margin-bottom: 20px; font-size: 22px;">✏️ 新建笔记</h2>
@@ -1546,12 +1618,15 @@ def new_note_form():
             </div>
         </form>
     </div>'''
-    return page('新建笔记', content)
+    return page('新建笔记', content, is_admin=True)
 
 
 @app.route('/create', method='POST')
 def create_note_handler():
     """处理创建笔记"""
+    r = require_auth()
+    if r:
+        return r
     req = request()
     form = req.form
     title = form.get('title', '').strip()
@@ -1563,7 +1638,7 @@ def create_note_handler():
             <h2 style="margin-bottom: 20px;">✏️ 新建笔记</h2>
             <div class="flash flash-error">标题和内容不能为空</div>
             <a href="/new" class="btn btn-primary">返回</a>
-        </div>''')
+        </div>''', is_admin=True)
 
     note = create_note(title, content)
     return Response().redirect(f'/note/{note["id"]}')
@@ -1572,6 +1647,7 @@ def create_note_handler():
 @app.route('/note/<note_id>')
 def view_note(note_id):
     """查看笔记详情"""
+    is_admin = check_auth()
     try:
         nid = int(note_id)
     except ValueError:
@@ -1591,18 +1667,23 @@ def view_note(note_id):
     attachments = note.get('attachments', [])
 
     # 附件区域
-    att_html = render_attachments_html(note['id'], attachments)
-    attachments_section = f'''
-    <div class="attachments-section">
-        <h3>📎 附件 ({len(attachments)})</h3>
-        {att_html}
+    att_html = render_attachments_html(note['id'], attachments, is_admin=is_admin)
+    upload_form = f'''
         <div class="upload-form">
             <form method="POST" action="/note/{note['id']}/upload" enctype="multipart/form-data">
                 <input type="file" name="file" required>
                 <button type="submit" class="btn btn-primary btn-sm">📤 上传</button>
             </form>
-        </div>
+        </div>''' if is_admin else ''
+    attachments_section = f'''
+    <div class="attachments-section">
+        <h3>📎 附件 ({len(attachments)})</h3>
+        {att_html}
+        {upload_form}
     </div>'''
+
+    edit_btn = f'<a href="/edit/{note["id"]}" class="btn btn-success btn-sm">✏️ 编辑</a>' if is_admin else ''
+    delete_btn = f'<a href="/delete/{note["id"]}" class="btn btn-danger btn-sm" onclick="return confirm(\'确定删除「{title}」？\')">🗑️ 删除</a>' if is_admin else ''
 
     body = f'''
     <div class="note-detail">
@@ -1613,19 +1694,21 @@ def view_note(note_id):
         <div class="content markdown-body">{content_html}</div>
         {attachments_section}
         <div class="actions">
-            <a href="/edit/{note['id']}" class="btn btn-success btn-sm">✏️ 编辑</a>
-            <a href="/delete/{note['id']}" class="btn btn-danger btn-sm"
-               onclick="return confirm('确定删除「{title}」？')">🗑️ 删除</a>
+            {edit_btn}
+            {delete_btn}
             <a href="/" class="btn btn-secondary btn-sm">← 返回列表</a>
         </div>
     </div>'''
 
-    return page(title, body)
+    return page(title, body, is_admin=is_admin)
 
 
 @app.route('/edit/<note_id>')
 def edit_note_form(note_id):
     """编辑笔记表单"""
+    r = require_auth()
+    if r:
+        return r
     try:
         nid = int(note_id)
     except ValueError:
@@ -1638,7 +1721,7 @@ def edit_note_form(note_id):
             <div class="icon">😕</div>
             <h2>笔记未找到</h2>
             <p><a href="/">返回首页</a></p>
-        </div>''')
+        </div>''', is_admin=True)
 
     title_val = note['title'].replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
     content_val = note['content'].replace('<', '&lt;').replace('>', '&gt;')
@@ -1662,12 +1745,15 @@ def edit_note_form(note_id):
         </form>
     </div>'''
 
-    return page(f'编辑: {note["title"]}', body)
+    return page(f'编辑: {note["title"]}', body, is_admin=True)
 
 
 @app.route('/update/<note_id>', method='POST')
 def update_note_handler(note_id):
     """处理更新笔记"""
+    r = require_auth()
+    if r:
+        return r
     try:
         nid = int(note_id)
     except ValueError:
@@ -1681,7 +1767,7 @@ def update_note_handler(note_id):
     if not title or not content:
         return page('编辑笔记', f'''
         <div class="flash flash-error">标题和内容不能为空</div>
-        <a href="/edit/{note_id}" class="btn btn-primary">返回重试</a>''')
+        <a href="/edit/{note_id}" class="btn btn-primary">返回重试</a>''', is_admin=True)
 
     note = update_note(nid, title, content)
     if not note:
@@ -1690,7 +1776,7 @@ def update_note_handler(note_id):
             <div class="icon">😕</div>
             <h2>笔记未找到</h2>
             <p><a href="/">返回首页</a></p>
-        </div>''')
+        </div>''', is_admin=True)
 
     return Response().redirect(f'/note/{nid}')
 
@@ -1698,6 +1784,9 @@ def update_note_handler(note_id):
 @app.route('/delete/<note_id>')
 def delete_note_handler(note_id):
     """处理删除笔记"""
+    r = require_auth()
+    if r:
+        return r
     try:
         nid = int(note_id)
     except ValueError:
@@ -1710,7 +1799,7 @@ def delete_note_handler(note_id):
             <div class="icon">😕</div>
             <h2>笔记未找到</h2>
             <p><a href="/">返回首页</a></p>
-        </div>''')
+        </div>''', is_admin=True)
 
     return page('已删除', f'''
     <div class="empty-state">
@@ -1718,7 +1807,7 @@ def delete_note_handler(note_id):
         <h2>笔记已删除</h2>
         <p>「{note["title"]}」已被永久删除</p>
         <p style="margin-top: 16px;"><a href="/" class="btn btn-primary">← 返回首页</a></p>
-    </div>''')
+    </div>''', is_admin=True)
 
 
 # ============================================================
@@ -1728,6 +1817,9 @@ def delete_note_handler(note_id):
 @app.route('/note/<note_id>/upload', method='POST')
 def upload_attachment(note_id):
     """上传附件到笔记"""
+    r = require_auth()
+    if r:
+        return r
     try:
         nid = int(note_id)
     except ValueError:
@@ -1740,7 +1832,7 @@ def upload_attachment(note_id):
             <div class="icon">😕</div>
             <h2>笔记未找到</h2>
             <p><a href="/">返回首页</a></p>
-        </div>''')
+        </div>''', is_admin=True)
 
     req = request()
     fields, uploaded_files = req.files
@@ -1748,7 +1840,7 @@ def upload_attachment(note_id):
     if 'file' not in uploaded_files:
         return page('上传失败', f'''
         <div class="flash flash-error">未选择文件</div>
-        <a href="/note/{note_id}" class="btn btn-primary">返回</a>''')
+        <a href="/note/{note_id}" class="btn btn-primary">返回</a>''', is_admin=True)
 
     file_info = uploaded_files['file']
     original_name = file_info['filename']
@@ -1758,12 +1850,12 @@ def upload_attachment(note_id):
     if len(file_data) > MAX_UPLOAD_SIZE:
         return page('上传失败', f'''
         <div class="flash flash-error">文件过大（最大 50MB）</div>
-        <a href="/note/{note_id}" class="btn btn-primary">返回</a>''')
+        <a href="/note/{note_id}" class="btn btn-primary">返回</a>''', is_admin=True)
 
     if not original_name:
         return page('上传失败', f'''
         <div class="flash flash-error">文件名不能为空</div>
-        <a href="/note/{note_id}" class="btn btn-primary">返回</a>''')
+        <a href="/note/{note_id}" class="btn btn-primary">返回</a>''', is_admin=True)
 
     # 保存文件
     stored_name, file_size = save_uploaded_file(file_data, original_name)
@@ -1816,6 +1908,9 @@ def download_attachment(filename):
 @app.route('/note/<note_id>/attachment/<stored_name>/delete', method='POST')
 def delete_attachment(note_id, stored_name):
     """删除笔记的附件"""
+    r = require_auth()
+    if r:
+        return r
     try:
         nid = int(note_id)
     except ValueError:
@@ -1832,7 +1927,82 @@ def delete_attachment(note_id, stored_name):
         <div class="icon">😕</div>
         <h2>附件未找到</h2>
         <p><a href="/note/{note_id}">返回笔记</a></p>
+    </div>''', is_admin=True)
+
+
+# ============================================================
+# 认证路由
+# ============================================================
+
+@app.route('/login')
+def login_form():
+    """登录页面"""
+    content = '''
+    <div class="form-card" style="max-width:400px;margin:40px auto;">
+        <h2 style="margin-bottom:20px;font-size:22px;">🔑 登录管理</h2>
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" placeholder="admin" required autofocus>
+            </div>
+            <div class="form-group">
+                <label for="password">密码</label>
+                <input type="password" id="password" name="password" placeholder="Enter password..." required>
+            </div>
+            <div class="form-actions">
+                <a href="/" class="btn btn-secondary">返回</a>
+                <button type="submit" class="btn btn-success">🔑 登录</button>
+            </div>
+        </form>
+    </div>'''
+    return page('登录管理', content)
+
+
+@app.route('/login', method='POST')
+def login_handler():
+    """处理登录"""
+    req = request()
+    form = req.form
+    username = form.get('username', '').strip()
+    password = form.get('password', '').strip()
+
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        token = generate_session_token()
+        _sessions[token] = username
+        resp = Response().redirect('/')
+        resp.headers['Set-Cookie'] = f'session={token}; Path=/; HttpOnly'
+        return resp
+
+    return page('登录管理', '''
+    <div class="form-card" style="max-width:400px;margin:40px auto;">
+        <h2 style="margin-bottom:20px;font-size:22px;">🔑 登录管理</h2>
+        <div class="flash flash-error">用户名或密码错误</div>
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" placeholder="admin" required autofocus>
+            </div>
+            <div class="form-group">
+                <label for="password">密码</label>
+                <input type="password" id="password" name="password" placeholder="Enter password..." required>
+            </div>
+            <div class="form-actions">
+                <a href="/" class="btn btn-secondary">返回</a>
+                <button type="submit" class="btn btn-success">🔑 登录</button>
+            </div>
+        </form>
     </div>''')
+
+
+@app.route('/logout')
+def logout_handler():
+    """处理退出登录"""
+    cookies = parse_cookies(request())
+    token = cookies.get('session', '')
+    _sessions.pop(token, None)
+    resp = Response().redirect('/')
+    resp.headers['Set-Cookie'] = 'session=; Path=/; HttpOnly; Max-Age=0'
+    return resp
 
 
 # ============================================================
@@ -1862,6 +2032,9 @@ def api_get(note_id):
 @app.route('/api/notes', method='POST')
 def api_create():
     """API: 创建笔记"""
+    r = require_auth()
+    if r:
+        return r
     req = request()
     data = req.json or {}
     title = data.get('title', '').strip()
@@ -1875,6 +2048,9 @@ def api_create():
 @app.route('/api/notes/<note_id>', method='POST')
 def api_update(note_id):
     """API: 更新笔记"""
+    r = require_auth()
+    if r:
+        return r
     try:
         nid = int(note_id)
     except ValueError:
@@ -1892,6 +2068,9 @@ def api_update(note_id):
 @app.route('/api/notes/<note_id>', method='DELETE')
 def api_delete(note_id):
     """API: 删除笔记"""
+    r = require_auth()
+    if r:
+        return r
     try:
         nid = int(note_id)
     except ValueError:
