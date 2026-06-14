@@ -13,3 +13,4 @@ venv/
 .env
 *.pyc
 uploads/
+notes_data.json
