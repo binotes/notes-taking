@@ -11,7 +11,7 @@ notes_app.py - 纯 Python 标准库笔记应用
   - 编辑笔记
   - 删除笔记
   - 搜索笔记
-  - JSON 文件持久化
+  - SQLite 持久化
 
 用法:
   python3 notes_app.py              # 启动 (localhost:8080)
@@ -28,107 +28,185 @@ import os
 import time
 import uuid
 import mimetypes
+import sqlite3
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
 # ============================================================
-# 数据层
+# 数据层 (SQLite)
 # ============================================================
 
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'notes_data.json')
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'notes.db')
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB max per file
 
 
+def get_connection():
+    """获取数据库连接"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    """初始化数据库表"""
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER NOT NULL,
+                stored_name TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                uploaded_at TEXT NOT NULL,
+                FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
+            )
+        """)
+        conn.commit()
+
+
 def load_notes():
-    """从 JSON 文件加载笔记"""
-    if not os.path.exists(DATA_FILE):
-        return []
-    try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, IOError):
-        return []
-
-
-def save_notes(notes):
-    """保存笔记到 JSON 文件"""
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(notes, f, ensure_ascii=False, indent=2)
-
-
-def next_id(notes):
-    """生成下一个可用 ID"""
-    if not notes:
-        return 1
-    return max(n['id'] for n in notes) + 1
+    """从 SQLite 加载所有笔记（含附件）"""
+    with get_connection() as conn:
+        cur = conn.execute("SELECT id, title, content, created_at, updated_at FROM notes ORDER BY id DESC")
+        notes = [dict(r) for r in cur.fetchall()]
+        if notes:
+            note_ids = [n['id'] for n in notes]
+            placeholders = ','.join('?' * len(note_ids))
+            cur2 = conn.execute(
+                f"SELECT note_id, stored_name, original_name, size, uploaded_at FROM attachments WHERE note_id IN ({placeholders}) ORDER BY uploaded_at",
+                note_ids
+            )
+            att_map = {}
+            for r in cur2.fetchall():
+                d = dict(r)
+                nid = d.pop('note_id')
+                att_map.setdefault(nid, []).append(d)
+            for n in notes:
+                n['attachments'] = att_map.get(n['id'], [])
+        return notes
 
 
 def get_note(note_id):
-    """按 ID 获取笔记"""
-    notes = load_notes()
-    for n in notes:
-        if n['id'] == note_id:
-            return n
-    return None
+    """按 ID 获取笔记（含附件）"""
+    with get_connection() as conn:
+        cur = conn.execute("SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?", (note_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        note = dict(row)
+        cur2 = conn.execute(
+            "SELECT stored_name, original_name, size, uploaded_at FROM attachments WHERE note_id = ? ORDER BY uploaded_at",
+            (note_id,)
+        )
+        note['attachments'] = [dict(r) for r in cur2.fetchall()]
+        return note
 
 
 def create_note(title, content):
     """创建新笔记"""
-    notes = load_notes()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    note = {
-        'id': next_id(notes),
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO notes (title, content, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (title.strip(), content.strip(), now, now)
+        )
+        note_id = cur.lastrowid
+        conn.commit()
+    return {
+        'id': note_id,
         'title': title.strip(),
         'content': content.strip(),
         'created_at': now,
         'updated_at': now,
+        'attachments': [],
     }
-    notes.insert(0, note)
-    save_notes(notes)
-    return note
 
 
 def update_note(note_id, title=None, content=None):
     """更新笔记"""
-    notes = load_notes()
-    for n in notes:
-        if n['id'] == note_id:
-            if title is not None:
-                n['title'] = title.strip()
-            if content is not None:
-                n['content'] = content.strip()
-            n['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            save_notes(notes)
-            return n
-    return None
+    with get_connection() as conn:
+        cur = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        new_title = title.strip() if title is not None else row['title']
+        new_content = content.strip() if content is not None else row['content']
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        conn.execute(
+            "UPDATE notes SET title = ?, content = ?, updated_at = ? WHERE id = ?",
+            (new_title, new_content, now, note_id)
+        )
+        conn.commit()
+
+        note = dict(row)
+        note['title'] = new_title
+        note['content'] = new_content
+        note['updated_at'] = now
+
+        cur2 = conn.execute(
+            "SELECT stored_name, original_name, size, uploaded_at FROM attachments WHERE note_id = ? ORDER BY uploaded_at",
+            (note_id,)
+        )
+        note['attachments'] = [dict(r) for r in cur2.fetchall()]
+        return note
 
 
 def delete_note(note_id):
     """删除笔记（含附件文件）"""
-    notes = load_notes()
-    for i, n in enumerate(notes):
-        if n['id'] == note_id:
-            # 先清理附件文件
-            delete_note_attachments(n)
-            deleted = notes.pop(i)
-            save_notes(notes)
-            return deleted
-    return None
+    note = get_note(note_id)
+    if note is None:
+        return None
+
+    # 先清理附件文件（CASCADE 会删除数据库记录）
+    delete_note_attachments(note)
+
+    with get_connection() as conn:
+        conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        conn.commit()
+    return note
 
 
 def search_notes(keyword):
     """搜索笔记（标题和内容）"""
-    notes = load_notes()
     keyword = keyword.lower().strip()
     if not keyword:
+        return load_notes()
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT id, title, content, created_at, updated_at FROM notes WHERE LOWER(title) LIKE ? OR LOWER(content) LIKE ? ORDER BY id DESC",
+            (f'%{keyword}%', f'%{keyword}%')
+        )
+        notes = [dict(r) for r in cur.fetchall()]
+
+        if notes:
+            note_ids = [n['id'] for n in notes]
+            placeholders = ','.join('?' * len(note_ids))
+            cur2 = conn.execute(
+                f"SELECT note_id, stored_name, original_name, size, uploaded_at FROM attachments WHERE note_id IN ({placeholders}) ORDER BY uploaded_at",
+                note_ids
+            )
+            att_map = {}
+            for r in cur2.fetchall():
+                d = dict(r)
+                nid = d.pop('note_id')
+                att_map.setdefault(nid, []).append(d)
+            for n in notes:
+                n['attachments'] = att_map.get(n['id'], [])
         return notes
-    results = []
-    for n in notes:
-        if keyword in n['title'].lower() or keyword in n['content'].lower():
-            results.append(n)
-    return results
 
 
 # ============================================================
@@ -143,7 +221,6 @@ def ensure_upload_dir():
 def save_uploaded_file(file_data, original_name):
     """保存上传文件，返回 (存储文件名, 文件大小)"""
     ensure_upload_dir()
-    # 生成唯一文件名，防止冲突
     ext = os.path.splitext(original_name)[1]
     stored_name = f"{uuid.uuid4().hex}{ext}"
     filepath = os.path.join(UPLOAD_DIR, stored_name)
@@ -154,42 +231,47 @@ def save_uploaded_file(file_data, original_name):
 
 def add_attachment(note_id, stored_name, original_name, file_size):
     """为笔记添加附件记录"""
-    notes = load_notes()
-    for n in notes:
-        if n['id'] == note_id:
-            if 'attachments' not in n:
-                n['attachments'] = []
-            n['attachments'].append({
-                'stored_name': stored_name,
-                'original_name': original_name,
-                'size': file_size,
-                'uploaded_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            })
-            n['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            save_notes(notes)
-            return n['attachments'][-1]
-    return None
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with get_connection() as conn:
+        cur = conn.execute("SELECT id FROM notes WHERE id = ?", (note_id,))
+        if cur.fetchone() is None:
+            return None
+
+        conn.execute(
+            "INSERT INTO attachments (note_id, stored_name, original_name, size, uploaded_at) VALUES (?, ?, ?, ?, ?)",
+            (note_id, stored_name, original_name, file_size, now)
+        )
+        conn.execute("UPDATE notes SET updated_at = ? WHERE id = ?", (now, note_id))
+        conn.commit()
+
+    return {
+        'stored_name': stored_name,
+        'original_name': original_name,
+        'size': file_size,
+        'uploaded_at': now,
+    }
 
 
 def remove_attachment(note_id, stored_name):
     """删除笔记的附件（记录 + 文件）"""
-    notes = load_notes()
-    for n in notes:
-        if n['id'] == note_id:
-            if 'attachments' not in n:
-                return False
-            for i, att in enumerate(n['attachments']):
-                if att['stored_name'] == stored_name:
-                    # 删除物理文件
-                    filepath = os.path.join(UPLOAD_DIR, stored_name)
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
-                    # 删除记录
-                    n['attachments'].pop(i)
-                    n['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    save_notes(notes)
-                    return True
-    return False
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT stored_name, original_name, size, uploaded_at FROM attachments WHERE note_id = ? AND stored_name = ?",
+            (note_id, stored_name)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False
+
+        filepath = os.path.join(UPLOAD_DIR, stored_name)
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+        conn.execute("DELETE FROM attachments WHERE note_id = ? AND stored_name = ?", (note_id, stored_name))
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        conn.execute("UPDATE notes SET updated_at = ? WHERE id = ?", (now, note_id))
+        conn.commit()
+        return True
 
 
 def delete_note_attachments(note):
@@ -711,7 +793,7 @@ class miniweb:
             print(f"║        Notes App - 纯 Python 笔记应用        ║")
             print(f"║                                              ║")
             print(f"║  http://{host if host != '0.0.0.0' else 'localhost'}:{port}                  ║")
-            print(f"║  数据文件: {os.path.basename(DATA_FILE)}                   ║")
+            print(f"║  数据文件: notes.db                      ║")
             print(f"║  上传目录: {os.path.basename(UPLOAD_DIR)}/                      ║")
             print(f"╚══════════════════════════════════════════════╝")
             try:
@@ -1703,14 +1785,16 @@ def download_attachment(filename):
     if not os.path.isfile(filepath):
         return Response('<h1>404 Not Found</h1>', status=404)
 
-    # 获取原始文件名（从笔记数据中查找）
+    # 获取原始文件名（从 SQLite 查询）
     original_name = filename
-    notes = load_notes()
-    for n in notes:
-        for att in n.get('attachments', []):
-            if att['stored_name'] == filename:
-                original_name = att['original_name']
-                break
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT original_name FROM attachments WHERE stored_name = ? LIMIT 1",
+            (filename,)
+        )
+        row = cur.fetchone()
+        if row is not None:
+            original_name = row['original_name']
 
     # 检测 MIME 类型
     content_type, _ = mimetypes.guess_type(original_name)
@@ -1833,4 +1917,8 @@ if __name__ == '__main__':
 
     app.host = args.host
     app.port = args.port
+
+    # 初始化数据库
+    init_db()
+
     app.run(debug=args.debug)
